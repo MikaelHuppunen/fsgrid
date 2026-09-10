@@ -39,6 +39,25 @@
 namespace fsgrid_detail {
 using namespace fsgrid;
 
+__device__ inline FsStencil makeStencilDevice(StencilConstants stencilConstants, int32_t x, int32_t y, int32_t z) { return FsStencil(x, y, z, stencilConstants); }
+
+/*! Parallelised for loop interface */
+template <typename Lambda, typename T>
+__global__ void parallel_for_GPU_kernel(
+   std::span<T> technical, Lambda loop_body, StencilConstants stencilConstants, const Coordinates& coordinates, FsIndex_t totalLocalSize, FsIndex_t localSize0, FsIndex_t localSize1
+){
+   auto index = blockIdx.x*blockDim.x + threadIdx.x;
+   auto k = index / (localSize0*localSize1);
+   auto j = (index - k*localSize0*localSize1) / localSize0;
+   auto i = index - k*localSize0*localSize1 - j*localSize0;
+
+   const auto s = makeStencilDevice(stencilConstants, i, j, k);
+   const auto& tech = technical[s.ooo()];
+   const auto sysBoundaryFlag = tech.sysBoundaryFlag;
+   const auto sysBoundaryLayer = tech.sysBoundaryLayer;
+   loop_body(coordinates, s, sysBoundaryFlag, sysBoundaryLayer);
+}
+
 // Assumes x, y and z to belong to set [-1, 0, 1]
 // returns a value in (inclusive) range [0, 26]
 constexpr static uint32_t xyzToLinear(int32_t x, int32_t y, int32_t z) {
@@ -496,6 +515,25 @@ public:
          }
          timer.stop(getNumCells(), "Spatial Cells");
       }
+   }
+
+   /*! Parallelised for loop interface */
+   template <typename Lambda, typename TimerCallBack, typename T>
+   void parallel_for_GPU(TimerCallBack timerCallBack, int timerId, std::span<T> technical, Lambda loop_body) {
+      // Using raw pointer for localSize;
+      // Workaround intel compiler bug in collapsed openmp loops
+      // see https://github.com/fmihpc/vlasiator/commit/604c81142729c5025a0073cd5dc64a24882f1675
+      const FsIndex_t* localSize = &coordinates.localSize[0];
+
+      FsIndex_t totalLocalSize = localSize[2]*localSize[1]*localSize[0];
+      FsIndex_t totalThreadsPerBlock = 512;
+      FsIndex_t blocksPerGrid = (totalLocalSize+totalThreadsPerBlock-1)/totalThreadsPerBlock;
+
+      auto timer = timerCallBack(timerId);
+      parallel_for_GPU_kernel<<<blocksPerGrid, totalThreadsPerBlock>>>(
+         technical, loop_body, stencilConstants, coordinates, totalLocalSize, localSize[0], localSize[1]
+      );
+      timer.stop(getNumCells(), "Spatial Cells");  
    }
 
 /*! Same as above parallel_for but without parallelization */
