@@ -526,7 +526,12 @@ public:
       const FsIndex_t* localSize = &coordinates.localSize[0];
 
       FsIndex_t totalLocalSize = localSize[2]*localSize[1]*localSize[0];
-      FsIndex_t totalThreadsPerBlock = 512;
+
+      if(totalLocalSize == 0){
+         return;
+      }
+
+      FsIndex_t totalThreadsPerBlock = 256;
       FsIndex_t blocksPerGrid = (totalLocalSize+totalThreadsPerBlock-1)/totalThreadsPerBlock;
 
       auto timer = timerCallBack(timerId);
