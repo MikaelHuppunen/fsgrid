@@ -29,12 +29,30 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-//#include <functional>
+#include <functional>
 #include <mpi.h>
 #include <span>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <cuda_runtime.h>
+#include <climits>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+/* Define the CUDA error checking macro */
+#define CHK_ERR_FSGRID(err) (cuda_error_fsgrid(err, __FILE__, __LINE__))
+inline static void cuda_error_fsgrid(cudaError_t err, const char *file, int line) {
+   if (err != cudaSuccess) {
+      printf("\n\n%s in %s at line %d\n", cudaGetErrorString(err), file, line);
+      exit(1);
+   }
+}
+
+#define PACK true
+#define UNPACK false
 
 namespace fsgrid_detail {
 using namespace fsgrid;
@@ -232,6 +250,238 @@ static std::array<MPI_Datatype, 27> generateMPITypes(const std::array<FsIndex_t,
    return types;
 }
 
+namespace ghost_cell_data {
+
+   struct GhostCellRegion {
+      int start[3];
+      int size[3];
+      int shiftIndex;
+      size_t offset;
+      size_t count;
+   };
+
+   struct GhostCellLayout {
+      int n = 0;
+      size_t total = 0;
+      GhostCellRegion region[26];
+   };
+
+   //split the data into words, each thread handles one word
+   template <typename D>
+   struct GhostCellWord {
+      using type = std::conditional_t<(alignof(D) % 8 == 0 && sizeof(D) % 8 == 0), unsigned long long, std::conditional_t<(alignof(D) % 4 == 0 && sizeof(D) % 4 == 0), unsigned int, D>>;
+      static constexpr size_t wordsPerElement = sizeof(D) / sizeof(type);
+   };
+
+   template <typename D, bool Pack>
+   __global__ void ghostCellPackUnpack_kernel(D* __restrict__ data_input, D* __restrict__ buffer_input, const GhostCellLayout layout, size_t sizeX, size_t sizeY) {
+      using Word = typename GhostCellWord<D>::type;
+      constexpr size_t wordsPerElement = GhostCellWord<D>::wordsPerElement;
+
+      Word* __restrict__ data = reinterpret_cast<Word*>(data_input);
+      Word* __restrict__ buffer = reinterpret_cast<Word*>(buffer_input);
+      const size_t totalWords = layout.total * wordsPerElement;
+      const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+
+      for (size_t totalWordIndex = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; totalWordIndex < totalWords; totalWordIndex += stride) {
+         const size_t elementIndex = totalWordIndex / wordsPerElement;
+         const size_t wordIndex = totalWordIndex % wordsPerElement;
+
+         int k = 0;
+         while (k + 1 < layout.n && elementIndex >= layout.region[k + 1].offset) {
+            k++;
+         }
+
+         const GhostCellRegion& region = layout.region[k];
+
+         size_t element = elementIndex - region.offset;
+         const size_t elementX = element % static_cast<size_t>(region.size[0]);
+         element /= static_cast<size_t>(region.size[0]);
+         const size_t elementY = element % static_cast<size_t>(region.size[1]);
+         const size_t elementZ = element / static_cast<size_t>(region.size[1]);
+         const size_t index = ((static_cast<size_t>(region.start[2]) + elementZ) * sizeY + static_cast<size_t>(region.start[1]) + elementY) * sizeX + static_cast<size_t>(region.start[0]) + elementX;
+
+         if constexpr (Pack) {
+            buffer[totalWordIndex] = data[index * wordsPerElement + wordIndex];
+         } else {
+            data[index * wordsPerElement + wordIndex] = buffer[totalWordIndex];
+         }
+      }
+   }
+}//namespace ghost_cell_data
+
+struct GhostCellBuffers {
+   char* dev_send = nullptr;
+   char* dev_receive = nullptr;
+   char* host_send = nullptr;
+   char* host_receive = nullptr;
+   size_t capacity = 0;
+};
+
+class GhostCellCommunicator {
+public:
+   using BufferAllocator = std::function<GhostCellBuffers(size_t requiredBytes)>;
+
+   GhostCellCommunicator(
+      const std::array<FsIndex_t, 3>& storageSize, const std::array<FsIndex_t, 3>& localSize_input,
+      int stencil, const std::array<int, 27>& neighbourIndexToRank, MPI_Comm comm, BufferAllocator getBuffers
+   ) : 
+      storageSize_{static_cast<int>(storageSize[0]), static_cast<int>(storageSize[1]), static_cast<int>(storageSize[2])},
+      rank_(neighbourIndexToRank), comm_(comm), getBuffers_(std::move(getBuffers))
+   {
+      const std::array<int, 3> localSize = {static_cast<int>(localSize_input[0]), static_cast<int>(localSize_input[1]), static_cast<int>(localSize_input[2])};
+      send_ = buildGhostCellLayout(localSize, stencil, true);
+      receive_ = buildGhostCellLayout(localSize, stencil, false);
+   }
+
+   GhostCellCommunicator(const GhostCellCommunicator&) = delete;
+   GhostCellCommunicator& operator=(const GhostCellCommunicator&) = delete;
+
+   template <typename D>
+   size_t requiredBytes() const {
+      return std::max(send_.total, receive_.total) * sizeof(D);
+   }
+
+   template <typename D>
+   void updateGhostCells(D* data, cudaStream_t stream = nullptr) {
+      static_assert(std::is_trivially_copyable_v<D>);
+      using namespace ghost_cell_data;
+
+      if (comm_ == MPI_COMM_NULL) {
+         return;
+      }
+
+      const size_t bytesRequired = requiredBytes<D>();
+      if (bytesRequired == 0) {
+         return;
+      }
+
+      const GhostCellBuffers ghostCellBuffers = getBuffers_(bytesRequired);
+      if (ghostCellBuffers.capacity < bytesRequired || !ghostCellBuffers.dev_send || !ghostCellBuffers.dev_receive || !ghostCellBuffers.host_send || !ghostCellBuffers.host_receive) {
+         throw std::runtime_error("Failed to get ghost cell buffers");
+      }
+      dev_send_ = ghostCellBuffers.dev_send;
+      dev_receive_ = ghostCellBuffers.dev_receive;
+      host_send_ = ghostCellBuffers.host_send;
+      host_receive_ = ghostCellBuffers.host_receive;
+
+      std::array<MPI_Request, 26> receiveRequests;
+      std::array<MPI_Request, 26> sendRequests;
+      receiveRequests.fill(MPI_REQUEST_NULL);
+      sendRequests.fill(MPI_REQUEST_NULL);
+
+      for (int k = 0; k < receive_.n; k++) {
+         const GhostCellRegion& region = receive_.region[k];
+         mpiCheck(
+            MPI_Irecv(host_receive_ + region.offset * sizeof(D), castToInt(region.count * sizeof(D)), MPI_BYTE, rank_[26 - region.shiftIndex]
+            , region.shiftIndex, comm_, &receiveRequests[k]), "Failed to post ghost cell receive"
+         );
+      }
+
+      //pack
+      if (send_.total > 0) {
+         packOrUnpack<D, PACK>(data, reinterpret_cast<D*>(dev_send_), send_, stream);
+         CHK_ERR_FSGRID(cudaMemcpyAsync(host_send_, dev_send_, send_.total * sizeof(D), cudaMemcpyDeviceToHost, stream));
+         CHK_ERR_FSGRID(cudaStreamSynchronize(stream));
+      }
+
+      //send data
+      for (int k = 0; k < send_.n; k++) {
+         const GhostCellRegion& region = send_.region[k];
+         mpiCheck(
+            MPI_Isend(host_send_ + region.offset * sizeof(D), castToInt(region.count * sizeof(D)), MPI_BYTE, rank_[region.shiftIndex]
+            , region.shiftIndex, comm_, &sendRequests[k]), "Failed to post ghost cell send"
+         );
+      }
+
+      mpiCheck(MPI_Waitall(receive_.n, receiveRequests.data(), MPI_STATUSES_IGNORE), "Ghost cell receive failed");
+      //unpack
+      if (receive_.total > 0) {
+         CHK_ERR_FSGRID(cudaMemcpyAsync(dev_receive_, host_receive_, receive_.total * sizeof(D), cudaMemcpyHostToDevice, stream));
+         CHK_ERR_FSGRID(cudaStreamSynchronize(stream));
+         packOrUnpack<D, UNPACK>(data, reinterpret_cast<D*>(dev_receive_), receive_, stream);
+      }
+
+      mpiCheck(MPI_Waitall(send_.n, sendRequests.data(), MPI_STATUSES_IGNORE), "Ghost cell send failed");
+   }
+
+private:
+   using GhostCellLayout = ghost_cell_data::GhostCellLayout;
+   using GhostCellRegion = ghost_cell_data::GhostCellRegion;
+
+   GhostCellLayout buildGhostCellLayout(const std::array<int, 3>& localSize, int stencil, bool isSendLayout) const {
+      GhostCellLayout layout;
+      for (int i = 0; i < 27; i++) {
+         const std::array<int, 3> direction = {linearToX(i), linearToY(i), linearToZ(i)};
+
+         bool skip = (direction[0] == 0 && direction[1] == 0 && direction[2] == 0);
+         for (int i = 0; i < 3; i++) {
+            skip = skip || (storageSize_[i] == 1 && direction[i] != 0);
+         }
+
+         const int peer = isSendLayout ? rank_[i] : rank_[26 - i];
+         if (skip || peer == MPI_PROC_NULL) {
+            continue;
+         }
+
+         GhostCellRegion& region = layout.region[layout.n];
+         region.shiftIndex = i;
+         region.count = 1;
+
+         for (int i = 0; i < 3; i++) {
+            region.size[i] = (direction[i] == 0) ? localSize[i] : stencil;
+
+            if (storageSize_[i] == 1) {
+               region.start[i] = 0;
+            } else if (isSendLayout) {
+               region.start[i] = (direction[i] == 1) ? storageSize_[i] - 2 * stencil : stencil;
+            } else {
+               region.start[i] = (direction[i] == -1) ? storageSize_[i] - stencil : (direction[i] == 0 ? stencil : 0);
+            }
+
+            region.count *= static_cast<size_t>(region.size[i]);
+         }
+
+         region.offset = layout.total;
+         layout.total += region.count;
+         layout.n++;
+      }
+      return layout;
+   }
+
+   template <typename D, bool Pack>
+   void packOrUnpack(D* data, D* buffer, const GhostCellLayout& layout, cudaStream_t stream) const {
+      constexpr int threadsPerBlock = 256;
+      const size_t totalWords = layout.total * ghost_cell_data::GhostCellWord<D>::wordsPerElement;
+      const size_t blocksPerGrid = (totalWords + threadsPerBlock - 1) / threadsPerBlock;
+      const uint blocks = static_cast<uint>(std::min<size_t>(blocksPerGrid, (size_t)(UINT_MAX)));
+
+      ghost_cell_data::ghostCellPackUnpack_kernel<D, Pack><<<blocks, threadsPerBlock, 0, stream>>>(data, buffer, layout, static_cast<size_t>(storageSize_[0]), static_cast<size_t>(storageSize_[1]));
+
+      CHK_ERR_FSGRID(cudaGetLastError());
+   }
+
+   static int castToInt(size_t bytes) {
+      //TODO: allow larger messages by splitting them
+      if (bytes > static_cast<size_t>(INT_MAX)) {
+         throw std::runtime_error("Ghost cell message too large");
+      }
+      return static_cast<int>(bytes);
+   }
+
+   std::array<int, 3> storageSize_;
+   std::array<int, 27> rank_;
+   MPI_Comm comm_;
+   GhostCellLayout send_;
+   GhostCellLayout receive_;
+
+   BufferAllocator getBuffers_;
+   char* dev_send_ = nullptr;
+   char* dev_receive_ = nullptr;
+   char* host_send_ = nullptr;
+   char* host_receive_ = nullptr;
+};
+
 static std::vector<int32_t> taskPosToTask(MPI_Comm parentComm, MPI_Comm cartesianComm,
                                           const std::array<Task_t, 3>& numTasksPerDim) {
    std::vector<int32_t> tasks(static_cast<size_t>(numTasksPerDim[0] * numTasksPerDim[1] * numTasksPerDim[2]));
@@ -336,7 +586,13 @@ public:
          neighbourRankToIndex(mapNeighbourRankToIndex(neighbourIndexToRank, numProcs)),
          stencilConstants(coordinates.localSize, computeStencilMultipliers(coordinates),
                           computeStencilOffset(coordinates), stencil, makeNeigbourBitMask(rank, neighbourIndexToRank),
-                          makeNeigbourIsNullBitMask(neighbourIndexToRank)) {}
+                          makeNeigbourIsNullBitMask(neighbourIndexToRank)),
+         ghostCellCommunicator(coordinates.storageSize, coordinates.localSize, stencil, neighbourIndexToRank, comm3d, [this](size_t bytes) {
+            if (!ghostBufferAllocator) {
+               throw std::runtime_error("Ghost buffer allocator not set");
+            }
+            return ghostBufferAllocator(bytes);
+         }) {}
 
    template <typename D> auto getMPITypes() {
       auto bytes = sizeof(D);
@@ -470,6 +726,20 @@ public:
                "Synchronization at ghost cell update failed");
       mpiCheck(MPI_Waitall(27, sendRequests.data(), MPI_STATUSES_IGNORE),
                "Synchronization at ghost cell update failed");
+   }
+
+   void setGhostBufferAllocator(GhostCellCommunicator::BufferAllocator allocator) {
+      ghostBufferAllocator = std::move(allocator);
+   }
+
+   template <typename D>
+   size_t ghostBufferBytes() const {
+      return ghostCellCommunicator.requiredBytes<D>();
+   }
+
+   template <typename D>
+   void updateGhostCellsDevice(std::span<D> data, cudaStream_t stream = nullptr) {
+      ghostCellCommunicator.updateGhostCells(data.data(), stream);
    }
 
    /*! Perform an MPI_Allreduce with this grid's internal communicator
@@ -677,5 +947,7 @@ private:
 
    //!< Datatypes for sending and receiving data
    std::unordered_map<size_t, std::tuple<std::array<MPI_Datatype, 27>, std::array<MPI_Datatype, 27>>> neighbourMPITypes;
+   GhostCellCommunicator::BufferAllocator ghostBufferAllocator;
+   GhostCellCommunicator ghostCellCommunicator;
 };
 } // namespace fsgrid
