@@ -415,8 +415,8 @@ private:
          const std::array<int, 3> direction = {linearToX(i), linearToY(i), linearToZ(i)};
 
          bool skip = (direction[0] == 0 && direction[1] == 0 && direction[2] == 0);
-         for (int i = 0; i < 3; i++) {
-            skip = skip || (storageSize_[i] == 1 && direction[i] != 0);
+         for (int j = 0; j < 3; j++) {
+            skip = skip || (storageSize_[j] == 1 && direction[j] != 0);
          }
 
          const int peer = isSendLayout ? rank_[i] : rank_[26 - i];
