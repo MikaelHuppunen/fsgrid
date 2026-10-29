@@ -428,18 +428,18 @@ private:
          region.shiftIndex = i;
          region.count = 1;
 
-         for (int i = 0; i < 3; i++) {
-            region.size[i] = (direction[i] == 0) ? localSize[i] : stencil;
+         for (int j = 0; j < 3; j++) {
+            region.size[j] = (direction[j] == 0) ? localSize[j] : stencil;
 
-            if (storageSize_[i] == 1) {
-               region.start[i] = 0;
+            if (storageSize_[j] == 1) {
+               region.start[j] = 0;
             } else if (isSendLayout) {
-               region.start[i] = (direction[i] == 1) ? storageSize_[i] - 2 * stencil : stencil;
+               region.start[j] = (direction[j] == 1) ? storageSize_[j] - 2 * stencil : stencil;
             } else {
-               region.start[i] = (direction[i] == -1) ? storageSize_[i] - stencil : (direction[i] == 0 ? stencil : 0);
+               region.start[j] = (direction[j] == -1) ? storageSize_[j] - stencil : (direction[j] == 0 ? stencil : 0);
             }
 
-            region.count *= static_cast<size_t>(region.size[i]);
+            region.count *= static_cast<size_t>(region.size[j]);
          }
 
          region.offset = layout.total;
